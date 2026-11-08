@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Datasets and large image/video files (keep .gitkeep and data.yaml)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/images/train/*
+!data/processed/images/train/.gitkeep
+data/processed/images/val/*
+!data/processed/images/val/.gitkeep
+data/processed/images/test/*
+!data/processed/images/test/.gitkeep
+data/processed/labels/train/*
+!data/processed/labels/train/.gitkeep
+data/processed/labels/val/*
+!data/processed/labels/val/.gitkeep
+data/processed/labels/test/*
+!data/processed/labels/test/.gitkeep
+
+# Trained model weights (keep .gitkeep or explicitly committed weights)
+models/*.pt
+models/*.pth
+models/*.onnx
+!models/.gitkeep
+
+# Ultralytics / training runs
+runs/
+wandb/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
