@@ -11,6 +11,7 @@ env/
 # Datasets and large image/video files (keep .gitkeep and data.yaml)
 data/raw/*
 !data/raw/.gitkeep
+data/*.db
 data/processed/images/train/*
 !data/processed/images/train/.gitkeep
 data/processed/images/val/*

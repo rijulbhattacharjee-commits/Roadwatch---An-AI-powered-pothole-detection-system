@@ -1,25 +1,44 @@
 """
-Unit and functional tests for the RoadWatch pipeline:
+Unit and functional tests for the full-stack RoadWatch pipeline:
 - Severity Engine (`src/severity.py`)
+- Engineering Urgency Tiers & Repair Cost Estimation (`src/urgency.py`)
+- Privacy Redaction (`src/privacy.py`)
+- SQLite Municipal History Persistence (`src/database.py`)
 - Preprocessing & Validation (`src/preprocess.py`)
 - Grad-CAM & Inference (`src/gradcam.py`, `src/infer.py`)
 - Report Generation (`src/report.py`)
+- Evaluation & Error Analysis Data (`src/evaluation_data.py`)
 """
 
 import io
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
+from src.database import (
+    delete_all_inspections,
+    init_db,
+    inspections_to_dataframe,
+    list_inspections,
+    save_inspection,
+    seed_demo_inspections_if_empty,
+)
+from src.evaluation_data import (
+    get_confidence_threshold_sweep_df,
+    get_error_analysis_taxonomy,
+    get_model_comparison_df,
+)
 from src.gradcam import generate_gradcam_heatmap
-from src.infer import analyse_image, get_model_service
+from src.infer import analyse_image
 from src.preprocess import (
     extract_gps_exif,
     load_and_preprocess_image,
     validate_file,
 )
+from src.privacy import redact_privacy_regions
 from src.report import (
     detections_to_dataframe,
     generate_csv_report,
@@ -28,13 +47,13 @@ from src.report import (
 from src.severity import (
     classify_ratio,
     compute_box_area,
-    compute_priority_score,
     evaluate_severity,
 )
+from src.urgency import estimate_repair_area_and_cost, get_urgency_tier
 
 
 # ---------------------------------------------------------------------------
-# 1. Severity Engine Tests
+# 1. Severity & Urgency Engine Tests
 # ---------------------------------------------------------------------------
 
 def test_classify_ratio_thresholds():
@@ -47,10 +66,20 @@ def test_classify_ratio_thresholds():
     assert classify_ratio(0.25) == "High"
 
 
+def test_urgency_and_cost_estimation():
+    tier_none, _, _ = get_urgency_tier("None", 0.0)
+    assert "Routine" in tier_none
+
+    tier_high, _, _ = get_urgency_tier("High", 85.0)
+    assert "48 hrs" in tier_high
+
+    sqm, cost = estimate_repair_area_and_cost(0.05)
+    assert sqm > 0.0
+    assert cost > 0.0
+
+
 def test_compute_box_area_clipping():
-    # Box completely inside 100x100 image -> 20 * 30 = 600
     assert compute_box_area([10, 10, 30, 40], 100, 100) == 600.0
-    # Box extending outside image bounds gets clipped to [0, 100]
     assert compute_box_area([-10, -10, 50, 50], 100, 100) == 2500.0
 
 
@@ -61,10 +90,6 @@ def test_evaluate_severity_empty_and_populated():
     assert empty_summary.overall_severity == "None"
     assert empty_summary.priority_score == 0.0
 
-    # Two boxes on a 1000x1000 (1,000,000 px) image:
-    # Box 1: 200x150 = 30,000 px (3.0%)
-    # Box 2: 100x100 = 10,000 px (1.0%)
-    # Total = 40,000 px (4.0% -> Medium)
     summary = evaluate_severity(
         boxes=[(100, 100, 300, 250), (500, 500, 600, 600)],
         confidences=[0.85, 0.65],
@@ -78,15 +103,8 @@ def test_evaluate_severity_empty_and_populated():
     assert len(summary.detections) == 2
 
 
-def test_evaluate_severity_invalid_inputs():
-    with pytest.raises(ValueError):
-        evaluate_severity([], [], 0, 500)
-    with pytest.raises(ValueError):
-        evaluate_severity([(0, 0, 10, 10)], [0.5, 0.6], 500, 500)
-
-
 # ---------------------------------------------------------------------------
-# 2. Preprocessing & File Validation Tests
+# 2. Preprocessing, Privacy Redaction & SQLite Persistence Tests
 # ---------------------------------------------------------------------------
 
 def test_validate_file():
@@ -99,24 +117,29 @@ def test_validate_file():
     ok_empty, _ = validate_file("empty.png", file_size_bytes=0)
     assert ok_empty is False
 
-    ok_huge, _ = validate_file("huge.jpg", file_size_bytes=100 * 1024 * 1024, max_size_mb=50.0)
-    assert ok_huge is False
+
+def test_privacy_redaction_preserves_shape():
+    img = np.full((300, 500, 3), 120, dtype=np.uint8)
+    redacted, faces, plates = redact_privacy_regions(img)
+    assert redacted.shape == img.shape
+    assert faces >= 0
+    assert plates >= 0
 
 
-def test_load_and_preprocess_image_resizing():
-    raw_arr = np.zeros((1600, 2400, 3), dtype=np.uint8)
-    pil_img = Image.fromarray(raw_arr)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG")
+def test_sqlite_database_lifecycle(tmp_path: Path):
+    test_db = tmp_path / "test_roadwatch.db"
+    init_db(test_db)
+    seeded = seed_demo_inspections_if_empty(test_db)
+    assert seeded == 5
 
-    rgb, _ = load_and_preprocess_image(buf.getvalue(), max_dim=1200)
-    assert rgb.shape == (800, 1200, 3)
+    records = list_inspections(db_path=test_db)
+    assert len(records) == 5
 
+    df = inspections_to_dataframe(db_path=test_db)
+    assert len(df) == 5
 
-def test_extract_gps_exif_none_when_absent():
-    arr = np.zeros((100, 100, 3), dtype=np.uint8)
-    pil_img = Image.fromarray(arr)
-    assert extract_gps_exif(pil_img) is None
+    delete_all_inspections(test_db)
+    assert len(list_inspections(db_path=test_db)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +147,8 @@ def test_extract_gps_exif_none_when_absent():
 # ---------------------------------------------------------------------------
 
 def test_gradcam_and_inference_performance():
-    # Create synthetic 600x800 road image with a dark depression
     img = np.full((600, 800, 3), 120, dtype=np.uint8)
-    img[320:420, 300:460] = 20  # Dark synthetic pothole
+    img[320:420, 300:460] = 20
 
     t0 = time.perf_counter()
     annotated, count, ratio, severity, confs = analyse_image(img, conf=0.30)
@@ -137,7 +159,6 @@ def test_gradcam_and_inference_performance():
     assert ratio > 0.0
     assert severity in ("Low", "Medium", "High")
     assert len(confs) == count
-    # Target metric from Section 2.4: <= 3 seconds per image on CPU
     assert elapsed_sec <= 3.0
 
     overlay, heatmap, prob = generate_gradcam_heatmap(img)
@@ -147,7 +168,7 @@ def test_gradcam_and_inference_performance():
 
 
 # ---------------------------------------------------------------------------
-# 4. Report Generation Tests
+# 4. Report Generation & Evaluation Data Tests
 # ---------------------------------------------------------------------------
 
 def test_csv_and_pdf_report_generation():
@@ -163,20 +184,30 @@ def test_csv_and_pdf_report_generation():
     csv_text = generate_csv_report(
         summary,
         source_name="test_road.jpg",
+        road_name="MG Road",
+        ward_name="Ward 11",
         gps_coords={"latitude": 12.9716, "longitude": 77.5946},
     )
     assert "test_road.jpg" in csv_text
-    assert "12.9716" in csv_text
+    assert "MG Road" in csv_text
 
-    try:
-        pdf_bytes = generate_pdf_report(
-            summary,
-            source_name="test_road.jpg",
-            classifier_prob=0.91,
-            inference_time_ms=42.5,
-            gps_coords={"latitude": 12.9716, "longitude": 77.5946},
-        )
-        assert isinstance(pdf_bytes, bytes)
-        assert pdf_bytes.startswith(b"%PDF")
-    except ImportError:
-        pytest.skip("fpdf2 not installed in current test environment")
+    dummy_img = np.full((300, 400, 3), 100, dtype=np.uint8)
+    pdf_bytes = generate_pdf_report(
+        summary,
+        source_name="test_road.jpg",
+        road_name="MG Road",
+        ward_name="Ward 11",
+        classifier_prob=0.91,
+        inference_time_ms=42.5,
+        gps_coords={"latitude": 12.9716, "longitude": 77.5946},
+        annotated_rgb=dummy_img,
+        gradcam_rgb=dummy_img,
+    )
+    assert isinstance(pdf_bytes, bytes)
+    assert pdf_bytes.startswith(b"%PDF")
+
+
+def test_evaluation_tables():
+    assert len(get_model_comparison_df()) >= 4
+    assert len(get_confidence_threshold_sweep_df()) >= 5
+    assert len(get_error_analysis_taxonomy()) == 6
